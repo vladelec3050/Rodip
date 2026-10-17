@@ -172,6 +172,11 @@ WaylandCapture::WaylandCapture(QObject *parent) : QObject(parent) {
     qDBusRegisterMetaType<QList<PortalStream>>();
     qDBusRegisterMetaType<PortalShortcut>();
     qDBusRegisterMetaType<QList<PortalShortcut>>();
+    requestTimeout.setSingleShot(true);
+    requestTimeout.setInterval(90000);
+    connect(&requestTimeout, &QTimer::timeout, this, [this] {
+        fail("Портал захвата экрана не ответил. Проверьте, что выбранный для вашего рабочего стола xdg-desktop-portal backend запущен и что окно подтверждения не оказалось скрытым.");
+    });
 }
 
 WaylandCapture::~WaylandCapture() { stop(); }
@@ -257,12 +262,45 @@ void WaylandCapture::onShortcutActivated(const QDBusObjectPath &session, const Q
 void WaylandCapture::callRequest(const QString &method, const QList<QVariant> &arguments, const QString &stage) {
     QDBusMessage message = QDBusMessage::createMethodCall("org.freedesktop.portal.Desktop",
         "/org/freedesktop/portal/desktop", "org.freedesktop.portal.ScreenCast", method);
-    message.setArguments(arguments);
+    const QString token = QString("rodip_%1_%2").arg(stage, QString::number(QRandomGenerator::global()->generate()));
+    QString sender = bus.baseService();
+    sender.remove(':');
+    sender.replace('.', '_');
+    const QString expectedPath = "/org/freedesktop/portal/desktop/request/" + sender + "/" + token;
+    QList<QVariant> requestArguments = arguments;
+    bool hasOptions = false;
+    for (auto &argument : requestArguments) {
+        if (argument.metaType().id() != QMetaType::QVariantMap) continue;
+        QVariantMap options = argument.toMap();
+        options.insert("handle_token", token);
+        argument = QVariant::fromValue(options);
+        hasOptions = true;
+        break;
+    }
+    if (!hasOptions) { fail("Не удалось подготовить параметры запроса ScreenCast."); return; }
+    message.setArguments(requestArguments);
+    requestPath = expectedPath;
+    currentStage = stage;
+    if (!bus.connect("org.freedesktop.portal.Desktop", requestPath, "org.freedesktop.portal.Request",
+                     "Response", this, SLOT(onPortalResponse(uint,QVariantMap)))) {
+        fail("Не удалось подписаться на ответ ScreenCast портала.");
+        return;
+    }
+    requestTimeout.start();
     auto *watcher = new QDBusPendingCallWatcher(bus.asyncCall(message), this);
-    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, watcher, stage] {
+    connect(watcher, &QDBusPendingCallWatcher::finished, this, [this, watcher, stage, expectedPath] {
         QDBusPendingReply<QDBusObjectPath> reply = *watcher;
         watcher->deleteLater();
-        if (reply.isError()) { fail(reply.error().message()); return; }
+        if (reply.isError()) {
+            bus.disconnect("org.freedesktop.portal.Desktop", expectedPath, "org.freedesktop.portal.Request",
+                           "Response", this, SLOT(onPortalResponse(uint,QVariantMap)));
+            if (currentStage == stage) fail(reply.error().message());
+            return;
+        }
+        const QString actualPath = reply.value().path();
+        if (actualPath == expectedPath || currentStage != stage) return;
+        bus.disconnect("org.freedesktop.portal.Desktop", expectedPath, "org.freedesktop.portal.Request",
+                       "Response", this, SLOT(onPortalResponse(uint,QVariantMap)));
         connectRequestSignal(reply.value(), stage);
     });
 }
@@ -277,7 +315,10 @@ void WaylandCapture::connectRequestSignal(const QDBusObjectPath &path, const QSt
 }
 
 void WaylandCapture::onPortalResponse(uint response, const QVariantMap &results) {
-    bus.disconnect("org.freedesktop.portal.Desktop", requestPath, "org.freedesktop.portal.Request", "Response", this, SLOT(onPortalResponse(uint,QVariantMap)));
+    requestTimeout.stop();
+    const QString handledRequest = requestPath;
+    bus.disconnect("org.freedesktop.portal.Desktop", handledRequest, "org.freedesktop.portal.Request", "Response", this, SLOT(onPortalResponse(uint,QVariantMap)));
+    requestPath.clear();
     if (stopped) return;
     if (response != 0) { fail(response == 1 ? "Пользователь отменил выбор экрана." : "Портал отказал в захвате экрана."); return; }
     if (currentStage == "create") {
@@ -318,11 +359,22 @@ void WaylandCapture::openPipewire(const QVariantMap &results) {
 void WaylandCapture::fail(const QString &reason) {
     if (stopped) return;
     stopped = true;
+    requestTimeout.stop();
     emit failed(reason);
 }
 
 void WaylandCapture::stopCapture() {
     stopped = true;
+    requestTimeout.stop();
+    if (!requestPath.isEmpty()) {
+        const QString pendingRequest = requestPath;
+        bus.disconnect("org.freedesktop.portal.Desktop", pendingRequest, "org.freedesktop.portal.Request",
+                       "Response", this, SLOT(onPortalResponse(uint,QVariantMap)));
+        QDBusMessage close = QDBusMessage::createMethodCall("org.freedesktop.portal.Desktop", pendingRequest,
+            "org.freedesktop.portal.Request", "Close");
+        bus.call(close, QDBus::NoBlock);
+        requestPath.clear();
+    }
     if (video) { delete video; video = nullptr; }
     if (!sessionPath.isEmpty()) {
         QDBusMessage close = QDBusMessage::createMethodCall("org.freedesktop.portal.Desktop", sessionPath,

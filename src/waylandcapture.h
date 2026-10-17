@@ -5,6 +5,7 @@
 #include <QDBusConnection>
 #include <QDBusObjectPath>
 #include <QDBusUnixFileDescriptor>
+#include <QTimer>
 #include <QVariantMap>
 
 struct PortalStream {
@@ -49,6 +50,7 @@ private slots:
 private:
     class PipewireVideo;
     QDBusConnection bus = QDBusConnection::sessionBus();
+    QTimer requestTimeout;
     QString sessionPath;
     QString requestPath;
     QString currentStage;
